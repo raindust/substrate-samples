@@ -14,14 +14,11 @@ use frame_support::{
 use frame_system::{
     self as system,
 };
-use sp_core::crypto::KeyTypeId;
 use sp_std::prelude::*;
 use sp_std::str;
 
 use core::{convert::TryInto, fmt};
-use sp_runtime::{
-    offchain::{storage::StorageValueRef},
-};
+use sp_runtime::offchain;
 use codec::{Decode, Encode};
 use alt_serde::{Deserialize, Deserializer};
 use sp_std::fmt::Formatter;
@@ -32,7 +29,8 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
-pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"demo");
+pub const GITHUB_REPO: &[u8] = b"https://api.github.com/users/raindust";
+pub const USER_AGENT: &[u8] = b"raindust";
 
 #[serde(crate = "alt_serde")]
 #[derive(Encode, Decode, Deserialize)]
@@ -68,7 +66,9 @@ pub trait Trait: system::Trait {
 
 decl_error!(
     pub enum Error for Module<T: Trait> {
-        AlreadyFetched
+        URLParsingError,
+        HttpFetchingError,
+        ResponseParsingError,
     }
 );
 
@@ -80,19 +80,66 @@ decl_module! {
 		fn offchain_worker(block_number: T::BlockNumber) {
 			debug::info!("Entering off-chain workers");
 
-	        let result = Self::fetch_github_info(block_number);
+	        let result = Self::fetch_from_remote(block_number);
 	        if let Err(e) = result {
 	            debug::error!("Error: {:?}", e);
 	        }
 		}
-
 	}
 }
 
 impl<T: Trait> Module<T> {
-    fn fetch_github_info(block_number: T::BlockNumber) -> Result<(), Error<T>> {
+    fn fetch_from_remote(block_number: T::BlockNumber) -> Result<(), Error<T>> {
+        let height = block_number.try_into().ok().unwrap() as u64;
+
+        // query every 5 blocks
+        if height % 5 == 0 {
+            let resp_bytes = Self::fetch_github_info().map_err(|e| {
+                debug::error!("fetch_from_remote error: {:?}", e);
+                Error::<T>::HttpFetchingError
+            })?;
+
+            let resp_str = str::from_utf8(&resp_bytes)
+                .map_err(|_| Error::<T>::ResponseParsingError)?;
+            debug::info!("~~~ response content: {}", resp_str);
+
+            let github_info = serde_json::from_str::<GithubInfo>(resp_str)
+                .map_err(|_| Error::<T>::ResponseParsingError)?;
+            debug::info!("~~~ formatted response: {:?}", github_info);
+        }
 
         Ok(())
+    }
+
+    fn fetch_github_info() -> Result<Vec<u8>, Error<T>> {
+        let repo_url = str::from_utf8(GITHUB_REPO)
+            .map_err(|_| Error::<T>::URLParsingError)?;
+
+        let request = offchain::http::Request::get(repo_url);
+
+        // Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
+        let timeout = sp_io::offchain::timestamp().add(offchain::Duration::from_millis(3000));
+
+        let pending = request
+            .add_header(
+                "User-Agent",
+                str::from_utf8(USER_AGENT).map_err(|_| Error::<T>::HttpFetchingError)?,
+            )
+            .deadline(timeout)
+            .send()
+            .map_err(|_| Error::<T>::HttpFetchingError)?;
+
+        let response = pending
+            .try_wait(timeout)
+            .map_err(|_| Error::<T>::HttpFetchingError)?
+            .map_err(|_| Error::<T>::HttpFetchingError)?;
+
+        if response.code != 200 {
+            debug::error!("Unexpected http request status code: {}", response.code);
+            return Err(<Error<T>>::HttpFetchingError);
+        }
+
+        Ok(response.body().collect::<Vec<u8>>())
     }
 }
 
